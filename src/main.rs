@@ -3,26 +3,44 @@
 mod camera;
 mod draw;
 mod error;
+mod fx;
+mod gamma;
 mod types;
-mod vision;
-mod fx;          // NEW
+mod vision; // NEW
 
 use camera::CameraCapture;
-use draw::{draw_crosshair, draw_text_5x7, Drawer};
+use draw::{Drawer, draw_crosshair, draw_text_5x7};
 use error::Error;
+use fx::Fx;
 use std::time::{Duration, Instant};
 use types::{FrameBuffer, Mask};
 use vision::{
-    clear_mask, dab_mask, make_gaussian_stamp, median_background, blend_linear_in_place,
-    BG_CAPTURE_COUNT,
+    BG_CAPTURE_COUNT, blend_linear_in_place, clear_mask, dab_mask, make_gaussian_stamp,
+    median_background,
 };
-use fx::Fx;      // NEW
+
+use crate::gamma::GammaLut; // NEW
 
 fn main() -> Result<(), Error> {
     // --- Camera + Window setup ---
     let mut cam = CameraCapture::new(0, 640, 480)?;
     let (w, h) = cam.resolution();
-    let mut drawer = Drawer::new("Magic Eraser — Step 5 (FX Sparkles + Lightning)", w as usize, h as usize)?;
+
+    let lut = GammaLut::new();
+
+    let mut screen = FrameBuffer {
+        width: w as usize,
+        height: h as usize,
+        pixels: vec![0u32; (w as usize) * (h as usize)],
+    };
+
+    let mut mask_has_any = false;
+
+    let mut drawer = Drawer::new(
+        "Magic Eraser — Step 5 (FX Sparkles + Lightning)",
+        w as usize,
+        h as usize,
+    )?;
 
     // --- FPS accounting for HUD + terminal ---
     let mut last_fps_time = Instant::now();
@@ -68,9 +86,15 @@ fn main() -> Result<(), Error> {
             captured.clear();
             bg_image = None;
             clear_mask(&mut mask); // reset erase when starting a new BG
+            mask_has_any = false;
         }
-        if drawer.b_pressed_once() { show_bg = !show_bg; }
-        if drawer.c_pressed_once() { clear_mask(&mut mask); } // clears erase only
+        if drawer.b_pressed_once() {
+            show_bg = !show_bg;
+        }
+        if drawer.c_pressed_once() {
+            clear_mask(&mut mask);
+            mask_has_any = false;
+        } // clears erase only
 
         // 3) Capture flow
         if capturing_bg {
@@ -87,6 +111,7 @@ fn main() -> Result<(), Error> {
         if let (Some(_bg), true) = (bg_image.as_ref(), drawer.left_mouse_down()) {
             if let Some((mx, my)) = drawer.mouse_pos() {
                 dab_mask(&mut mask, mx as i32, my as i32, &stamp); // eraser grows here
+                mask_has_any = true;
                 erasing_now = true;
 
                 // --- FX spawns at the cursor while erasing ---
@@ -98,16 +123,28 @@ fn main() -> Result<(), Error> {
             }
         }
 
-        // 5) Compose the base frame to show (same logic as Step 4)
-        let mut screen = if show_bg {
-            if let Some(bg) = &bg_image { bg.clone() } else { live.clone() }
-        } else if let Some(bg) = &bg_image {
-            let mut blended = live.clone();
-            blend_linear_in_place(&mut blended, bg, &mask)?; // magic erase
-            blended
+        if show_bg {
+            if let Some(bg) = &bg_image {
+                // Visual: you see the static background immediately
+                screen.pixels.copy_from_slice(&bg.pixels);
+            } else {
+                // No BG yet: show the live frame
+                screen.pixels.copy_from_slice(&live.pixels);
+            }
         } else {
-            live.clone()
-        };
+            // Normal path: show the live camera
+            screen.pixels.copy_from_slice(&live.pixels);
+        }
+
+        // If we have BG and the mask has any painted pixels, blend in place on 'screen'.
+        if !show_bg {
+            if mask_has_any {
+                if let Some(bg) = &bg_image {
+                    // Visual: wherever you erased, BG shows with seamless edges; much less CPU
+                    blend_linear_in_place(&mut screen, bg, &mask, &lut)?;
+                }
+            }
+        }
 
         // 6) Update & render FX on top (additive glow/bolt)
         fx.update_and_render(&mut screen, dt);
@@ -122,12 +159,20 @@ fn main() -> Result<(), Error> {
         let status = if capturing_bg {
             format!("CAPTURING ({}/{})", captured.len(), BG_CAPTURE_COUNT)
         } else if bg_image.is_some() {
-            if show_bg { "BG READY (Showing)".to_string() } else { "BG READY".to_string() }
+            if show_bg {
+                "BG READY (Showing)".to_string()
+            } else {
+                "BG READY".to_string()
+            }
         } else {
             "IDLE".to_string()
         };
         let hint = if bg_image.is_some() {
-            if erasing_now { " | LMB: erasing…  C: clear  FX" } else { " | LMB: erase  C: clear  FX" }
+            if erasing_now {
+                " | LMB: erasing…  C: clear  FX"
+            } else {
+                " | LMB: erase  C: clear  FX"
+            }
         } else {
             " | Press R to capture BG"
         };
@@ -136,7 +181,7 @@ fn main() -> Result<(), Error> {
         draw_text_5x7(&mut screen, 8, 8, &hud, white);
 
         // 8) Present to screen
-        drawer.present(&mut screen)?;
+        drawer.present( &screen)?;
 
         // 9) FPS accounting (terminal + HUD)
         frames_this_second += 1;

@@ -1,7 +1,7 @@
 // Background median builder for Step 3.
 // Visual expectation: after you record N frames, the computed background looks
 // like your empty scene without moving subjects (hands/you/etc.).
-
+use crate::gamma::GammaLut;
 use crate::error::Error;
 use crate::types::{FrameBuffer, Mask, Stamp};
 
@@ -131,10 +131,16 @@ pub fn clear_mask(mask: &mut Mask) {
     if v < 0.0 { 0 } else if v > 255.0 { 255 } else { v as u8 }
 }
 
-/// Blend FG (live) with BG using the alpha mask in **linear light**.
-/// Visual: where alpha=1 you fully see the background; where 0 you see live; edges are invisible.
-pub fn blend_linear_in_place(fg_live: &mut FrameBuffer, bg: &FrameBuffer, mask: &Mask) -> Result<(), Error> {
-    // Precondition checks so you don't see scrambled pictures.
+/// out = α*BG + (1-α)*FG in linear light, using fast LUTs.
+/// Visual: same seamless edges; much lower CPU.
+pub fn blend_linear_in_place(
+    fg_live: &mut crate::types::FrameBuffer,
+    bg: &crate::types::FrameBuffer,
+    mask: &crate::types::Mask,
+    lut: &GammaLut,                    // <-- NEW: pass prebuilt LUT
+) -> Result<(), crate::error::Error> {
+    use crate::error::Error;
+
     if fg_live.width != bg.width || fg_live.height != bg.height {
         return Err(Error::CameraFrame("blend: dimension mismatch".into()));
     }
@@ -142,41 +148,52 @@ pub fn blend_linear_in_place(fg_live: &mut FrameBuffer, bg: &FrameBuffer, mask: 
         return Err(Error::CameraFrame("blend: mask dimension mismatch".into()));
     }
 
-    // For every pixel: out = α * BG + (1-α) * FG (all in linear space, per channel)
     let len = fg_live.width * fg_live.height;
     for i in 0..len {
-        // Unpack live FG
-        let px_f = fg_live.pixels[i];
-        let rf = ((px_f >> 16) & 0xFF) as u8;
-        let gf = ((px_f >>  8) & 0xFF) as u8;
-        let bf = ( px_f        & 0xFF) as u8;
-
-        // Unpack BG
-        let px_b = bg.pixels[i];
-        let rb = ((px_b >> 16) & 0xFF) as u8;
-        let gb = ((px_b >>  8) & 0xFF) as u8;
-        let bb = ( px_b        & 0xFF) as u8;
-
-        // Convert to linear light (0..1)
-        let rf_lin = srgb_u8_to_linear(rf);
-        let gf_lin = srgb_u8_to_linear(gf);
-        let bf_lin = srgb_u8_to_linear(bf);
-        let rb_lin = srgb_u8_to_linear(rb);
-        let gb_lin = srgb_u8_to_linear(gb);
-        let bb_lin = srgb_u8_to_linear(bb);
-
-        // Alpha for this pixel (0..1)
+        // Per-pixel alpha in [0,1]
         let a = mask.alpha[i];
 
-        // Linear blend
-        let r_lin = a * rb_lin + (1.0 - a) * rf_lin;
-        let g_lin = a * gb_lin + (1.0 - a) * gf_lin;
-        let b_lin = a * bb_lin + (1.0 - a) * bf_lin;
+        // Fast exits:
+        // α = 0  → keep foreground as-is (no work; nothing visible changes)
+        if a <= 0.0 { continue; }
+        // α = 1  → copy background pixel (you instantly see pure BG at that pixel)
+        if a >= 1.0 {
+            fg_live.pixels[i] = bg.pixels[i];
+            continue;
+        }
 
-        // Back to sRGB u8 and repack to 0x00RRGGBB
-        let r = linear_to_srgb_u8(r_lin) as u32;
-        let g = linear_to_srgb_u8(g_lin) as u32;
-        let b = linear_to_srgb_u8(b_lin) as u32;
+        // Unpack FG and BG (0x00RRGGBB)
+        let pf = fg_live.pixels[i];
+        let pb = bg.pixels[i];
+
+        let rf = ((pf >> 16) & 0xFF) as u8;
+        let gf = ((pf >>  8) & 0xFF) as u8;
+        let bf = ( pf        & 0xFF) as u8;
+
+        let rb = ((pb >> 16) & 0xFF) as u8;
+        let gb = ((pb >>  8) & 0xFF) as u8;
+        let bb = ( pb        & 0xFF) as u8;
+
+        // sRGB -> linear from LUT (you don't see this; it just gets faster)
+        let rf_lin = lut.srgb_u8_to_linear(rf);
+        let gf_lin = lut.srgb_u8_to_linear(gf);
+        let bf_lin = lut.srgb_u8_to_linear(bf);
+
+        let rb_lin = lut.srgb_u8_to_linear(rb);
+        let gb_lin = lut.srgb_u8_to_linear(gb);
+        let bb_lin = lut.srgb_u8_to_linear(bb);
+
+        // Linear blend (this is what gives you invisible edges on screen)
+        let inv = 1.0 - a;
+        let r_lin = a * rb_lin + inv * rf_lin;
+        let g_lin = a * gb_lin + inv * gf_lin;
+        let b_lin = a * bb_lin + inv * bf_lin;
+
+        // linear -> sRGB via LUT, then repack
+        let r = lut.linear_to_srgb_u8(r_lin) as u32;
+        let g = lut.linear_to_srgb_u8(g_lin) as u32;
+        let b = lut.linear_to_srgb_u8(b_lin) as u32;
+
         fg_live.pixels[i] = (r << 16) | (g << 8) | b;
     }
     Ok(())
