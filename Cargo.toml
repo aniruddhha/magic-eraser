@@ -1,0 +1,22 @@
+[package]
+name = "magic-eraser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+# Tiny window that can display a raw pixel buffer
+minifb = "0.28.0"
+# Image types for decoding frames from the camera (RGB image buffer)
+image = "0.25.8"
+
+# --- Camera backend: choose the native input per OS ---
+# nokhwa is pure-Rust camera capture. We enable the correct backend per platform.
+[target.'cfg(target_os = "windows")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-msmf"] }        # MediaFoundation
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-avfoundation"] } # AVFoundation
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-v4l"] }          # Video4Linux
