@@ -131,17 +131,118 @@ pub fn clear_mask(mask: &mut Mask) {
     if v < 0.0 { 0 } else if v > 255.0 { 255 } else { v as u8 }
 }
 
-/// out = α*BG + (1-α)*FG in linear light, using fast LUTs.
-/// Visual: same seamless edges; much lower CPU.
-pub fn blend_linear_in_place(
-    fg_live: &mut crate::types::FrameBuffer,
-    bg: &crate::types::FrameBuffer,
-    mask: &crate::types::Mask,
-    lut: &GammaLut,                    // <-- NEW: pass prebuilt LUT
-) -> Result<(), crate::error::Error> {
-    use crate::error::Error;
 
-    if fg_live.width != bg.width || fg_live.height != bg.height {
+pub fn box_blur_rgb(
+    src: &FrameBuffer,      // input (live camera for this frame)
+    tmp: &mut FrameBuffer,  // horizontal pass result (scratch)
+    dst: &mut FrameBuffer,  // final blurred output
+    radius: usize,          // blur amount; bigger = softer (and slightly slower)
+) -> Result<(), Error> {
+    if src.width != dst.width || src.height != dst.height {
+        return Err(Error::CameraFrame("box_blur: size mismatch src↔dst".into()));
+    }
+    if tmp.width != src.width || tmp.height != src.height {
+        return Err(Error::CameraFrame("box_blur: size mismatch tmp".into()));
+    }
+    let w = src.width as i32;     // screen width in pixels
+    let h = src.height as i32;    // screen height in pixels
+    let r = radius as i32;        // blur radius
+    let win = (2 * r + 1) as u32; // window width for averaging (constant everywhere)
+
+    /* ---- Pass 1: Horizontal (store averaged rows in tmp) ----
+       What you SEE: nothing yet (tmp is off-screen), but we prepare row averages. */
+    for y in 0..h {
+        // Grab row start index once (faster indexing)
+        let row_ofs = (y as usize) * (w as usize);
+
+        // Edge pixel value at x=0 (we "extend" edges to avoid dark borders)
+        let px0 = src.pixels[row_ofs + 0];
+        let (mut sr, mut sg, mut sb) = (
+            (((px0 >> 16) & 0xFF) as u32) * (r as u32 + 1),
+            (((px0 >>  8) & 0xFF) as u32) * (r as u32 + 1),
+            (((px0      ) & 0xFF) as u32) * (r as u32 + 1),
+        );
+
+        // Prime the right side of the initial window [0..r]
+        for x in 1..=r {
+            let xr = x.min(w - 1) as usize;        // clamp at right edge
+            let p = src.pixels[row_ofs + xr];
+            sr += ((p >> 16) & 0xFF) as u32;
+            sg += ((p >>  8) & 0xFF) as u32;
+            sb += ((p      ) & 0xFF) as u32;
+        }
+
+        // Slide the window across the row
+        for x in 0..w {
+            // Average = sum / window; pack back to 0x00RRGGBB
+            let r8 = (sr / win) as u32;
+            let g8 = (sg / win) as u32;
+            let b8 = (sb / win) as u32;
+            tmp.pixels[row_ofs + x as usize] = (r8 << 16) | (g8 << 8) | b8;
+
+            // Update sums for next column (add right, remove left)
+            let left_x  = (x - r).max(0) as usize;     // clamped left index
+            let right_x = (x + r + 1).min(w - 1) as usize; // clamped new right index
+
+            let p_sub = src.pixels[row_ofs + left_x];
+            let p_add = src.pixels[row_ofs + right_x];
+
+            sr = sr + (((p_add >> 16) & 0xFF) as u32) - (((p_sub >> 16) & 0xFF) as u32);
+            sg = sg + (((p_add >>  8) & 0xFF) as u32) - (((p_sub >>  8) & 0xFF) as u32);
+            sb = sb + (((p_add      ) & 0xFF) as u32) - (((p_sub      ) & 0xFF) as u32);
+        }
+    }
+
+    /* ---- Pass 2: Vertical (read tmp, write dst) ----
+       What you SEE: `dst` becomes a blurred copy of `src`. */
+    for x in 0..w {
+        // Edge pixel at y=0 for this column
+        let p0 = tmp.pixels[x as usize];
+        let (mut sr, mut sg, mut sb) = (
+            (((p0 >> 16) & 0xFF) as u32) * (r as u32 + 1),
+            (((p0 >>  8) & 0xFF) as u32) * (r as u32 + 1),
+            (((p0      ) & 0xFF) as u32) * (r as u32 + 1),
+        );
+
+        // Prime the initial window [0..r] downwards
+        for y in 1..=r {
+            let yr = y.min(h - 1);
+            let p = tmp.pixels[(yr as usize) * (w as usize) + x as usize];
+            sr += ((p >> 16) & 0xFF) as u32;
+            sg += ((p >>  8) & 0xFF) as u32;
+            sb += ((p      ) & 0xFF) as u32;
+        }
+
+        // Slide the window down the column
+        for y in 0..h {
+            let idx = (y as usize) * (w as usize) + x as usize;
+            let r8 = (sr / win) as u32;
+            let g8 = (sg / win) as u32;
+            let b8 = (sb / win) as u32;
+            dst.pixels[idx] = (r8 << 16) | (g8 << 8) | b8;
+
+            let top_y    = (y - r).max(0);
+            let bottom_y = (y + r + 1).min(h - 1);
+
+            let p_sub = tmp.pixels[(top_y as usize)    * (w as usize) + x as usize];
+            let p_add = tmp.pixels[(bottom_y as usize) * (w as usize) + x as usize];
+
+            sr = sr + (((p_add >> 16) & 0xFF) as u32) - (((p_sub >> 16) & 0xFF) as u32);
+            sg = sg + (((p_add >>  8) & 0xFF) as u32) - (((p_sub >>  8) & 0xFF) as u32);
+            sb = sb + (((p_add      ) & 0xFF) as u32) - (((p_sub      ) & 0xFF) as u32);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn blend_linear_in_place(
+    fg_live: &mut FrameBuffer,
+    sink: &FrameBuffer,     // NOTE: was `bg` before; now it's BLUR(LIVE)
+    mask: &Mask,
+    lut: &GammaLut,
+) -> Result<(), Error> {
+    if fg_live.width != sink.width || fg_live.height != sink.height {
         return Err(Error::CameraFrame("blend: dimension mismatch".into()));
     }
     if mask.width != fg_live.width || mask.height != fg_live.height {
@@ -150,51 +251,41 @@ pub fn blend_linear_in_place(
 
     let len = fg_live.width * fg_live.height;
     for i in 0..len {
-        // Per-pixel alpha in [0,1]
         let a = mask.alpha[i];
-
-        // Fast exits:
-        // α = 0  → keep foreground as-is (no work; nothing visible changes)
-        if a <= 0.0 { continue; }
-        // α = 1  → copy background pixel (you instantly see pure BG at that pixel)
-        if a >= 1.0 {
-            fg_live.pixels[i] = bg.pixels[i];
+        if a <= 0.0 { continue; }            // visual: keep raw live
+        if a >= 1.0 {                        // visual: fully blurred at this pixel
+            fg_live.pixels[i] = sink.pixels[i];
             continue;
         }
 
-        // Unpack FG and BG (0x00RRGGBB)
         let pf = fg_live.pixels[i];
-        let pb = bg.pixels[i];
+        let ps = sink.pixels[i];
 
-        let rf = ((pf >> 16) & 0xFF) as u8;
-        let gf = ((pf >>  8) & 0xFF) as u8;
-        let bf = ( pf        & 0xFF) as u8;
+        let rf = ((pf >> 16) & 0xFF) as u8;  // live R
+        let gf = ((pf >>  8) & 0xFF) as u8;  // live G
+        let bf = ( pf        & 0xFF) as u8;  // live B
 
-        let rb = ((pb >> 16) & 0xFF) as u8;
-        let gb = ((pb >>  8) & 0xFF) as u8;
-        let bb = ( pb        & 0xFF) as u8;
+        let rs = ((ps >> 16) & 0xFF) as u8;  // sink (blurred) R
+        let gs = ((ps >>  8) & 0xFF) as u8;  // sink (blurred) G
+        let bs = ( ps        & 0xFF) as u8;  // sink (blurred) B
 
-        // sRGB -> linear from LUT (you don't see this; it just gets faster)
         let rf_lin = lut.srgb_u8_to_linear(rf);
         let gf_lin = lut.srgb_u8_to_linear(gf);
         let bf_lin = lut.srgb_u8_to_linear(bf);
 
-        let rb_lin = lut.srgb_u8_to_linear(rb);
-        let gb_lin = lut.srgb_u8_to_linear(gb);
-        let bb_lin = lut.srgb_u8_to_linear(bb);
+        let rs_lin = lut.srgb_u8_to_linear(rs);
+        let gs_lin = lut.srgb_u8_to_linear(gs);
+        let bs_lin = lut.srgb_u8_to_linear(bs);
 
-        // Linear blend (this is what gives you invisible edges on screen)
         let inv = 1.0 - a;
-        let r_lin = a * rb_lin + inv * rf_lin;
-        let g_lin = a * gb_lin + inv * gf_lin;
-        let b_lin = a * bb_lin + inv * bf_lin;
+        let r_lin = a * rs_lin + inv * rf_lin;
+        let g_lin = a * gs_lin + inv * gf_lin;
+        let b_lin = a * bs_lin + inv * bf_lin;
 
-        // linear -> sRGB via LUT, then repack
         let r = lut.linear_to_srgb_u8(r_lin) as u32;
         let g = lut.linear_to_srgb_u8(g_lin) as u32;
         let b = lut.linear_to_srgb_u8(b_lin) as u32;
-
-        fg_live.pixels[i] = (r << 16) | (g << 8) | b;
+        fg_live.pixels[i] = (r << 16) | (g << 8) | b; // visual: blurred mix at this pixel
     }
     Ok(())
 }

@@ -1,196 +1,146 @@
-// Step 5 main: FX (sparkles + lightning) layered on top of your current pipeline.
+// What you SEE now:
+// • Live camera is always the base image.
+// • Hold Left Mouse: you "paint blur" into the live feed (soft edges).
+// • B toggles "show BLUR" (debug): the fully blurred live frame for this instant.
+// • C clears the painted mask. ESC quits.
+// • (R is unused now.)
 
 mod camera;
 mod draw;
 mod error;
-mod fx;
-mod gamma;
 mod types;
-mod vision; // NEW
+mod vision;
+mod gamma;
+mod fx;
 
 use camera::CameraCapture;
-use draw::{Drawer, draw_crosshair, draw_text_5x7};
+use draw::{draw_crosshair, draw_text_5x7, Drawer};
 use error::Error;
-use fx::Fx;
+use gamma::GammaLut;
 use std::time::{Duration, Instant};
 use types::{FrameBuffer, Mask};
-use vision::{
-    BG_CAPTURE_COUNT, blend_linear_in_place, clear_mask, dab_mask, make_gaussian_stamp,
-    median_background,
-};
-
-use crate::gamma::GammaLut; // NEW
+use vision::{box_blur_rgb, blend_linear_in_place};
+use fx::Fx;
 
 fn main() -> Result<(), Error> {
-    // --- Camera + Window setup ---
+    /* --- Camera + window setup ---
+       Visual: window opens with live camera feed. */
     let mut cam = CameraCapture::new(0, 640, 480)?;
     let (w, h) = cam.resolution();
+    let mut drawer = Drawer::new("Magic Eraser — Blur Brush", w as usize, h as usize)?;
 
-    let lut = GammaLut::new();
-
+    /* --- Reusable screen buffer ---
+       Visual: this is the image you actually see each frame. */
     let mut screen = FrameBuffer {
-        width: w as usize,
+        width:  w as usize,
         height: h as usize,
         pixels: vec![0u32; (w as usize) * (h as usize)],
     };
 
-    let mut mask_has_any = false;
+    /* --- Blur buffers (reused every frame) ---
+       Visual: `blur_tmp` is invisible scratch; `blur_sink` becomes BLUR(LIVE). */
+    let mut blur_tmp = FrameBuffer { width: screen.width, height: screen.height, pixels: vec![0u32; screen.pixels.len()] };
+    let mut blur_sink = FrameBuffer { width: screen.width, height: screen.height, pixels: vec![0u32; screen.pixels.len()] };
+    let blur_radius: usize = 8; // visual: softness of the blur brush (bigger = softer/slower)
 
-    let mut drawer = Drawer::new(
-        "Magic Eraser — Step 5 (FX Sparkles + Lightning)",
-        w as usize,
-        h as usize,
-    )?;
+    /* --- Gamma LUT (fast linear-light blend) ---
+       Visual: seamless edges with no halos when mixing blur into live. */
+    let lut = GammaLut::new();
 
-    // --- FPS accounting for HUD + terminal ---
+    /* --- Mask & brush stamp (same as before) ---
+       Visual: α mask controls where blur appears (1=blur, 0=raw live). */
+    let mut mask = Mask { width: screen.width, height: screen.height, alpha: vec![0.0; screen.pixels.len()] };
+    let eraser_radius: i32 = 22;       // visual: brush size in pixels
+    let sigma: f32 = eraser_radius as f32 * 0.5; // visual: feather softness
+    let stamp = vision::make_gaussian_stamp(eraser_radius, sigma);
+    let mut mask_has_any = false;      // visual: if false, we skip blending (faster)
+
+    /* --- FX (sparkles/lightning) ---
+       Visual: glows around your brush while painting; fades on its own. */
+    let mut fx = Fx::new(600);
+
+    /* --- HUD / FPS ---
+       Visual: small text shows mode hints + FPS. */
     let mut last_fps_time = Instant::now();
     let mut frames_this_second: u32 = 0;
     let mut hud_fps_text = String::from("FPS: 0.0");
-
-    // --- Frame delta time for FX simulation ---
     let mut last_frame_time = Instant::now();
 
-    // --- Step 3 state (capture BG) ---
-    let mut capturing_bg = false;
-    let mut captured: Vec<FrameBuffer> = Vec::new();
-    let mut bg_image: Option<FrameBuffer> = None;
-    let mut show_bg = false;
+    /* --- Debug toggles ---
+       Visual: B shows the full blurred frame; helpful to verify blur itself. */
+    let mut show_blur = false;
 
-    // --- Step 4 state (eraser) ---
-    let mut mask = Mask {
-        width: w as usize,
-        height: h as usize,
-        alpha: vec![0.0; (w as usize) * (h as usize)],
-    };
-    let eraser_radius: i32 = 22;
-    let sigma: f32 = eraser_radius as f32 * 0.5;
-    let stamp = make_gaussian_stamp(eraser_radius, sigma);
-
-    // --- Step 5 state (FX) ---
-    // Visual: capacity caps total sparkles on screen; tune for performance.
-    let mut fx = Fx::new(600);
-
-    // --- Main loop ---
+    /* ------------------------------ Main loop ------------------------------ */
     while drawer.is_open() && !drawer.esc_pressed() {
-        // dt for FX
-        let now_frame = Instant::now();
-        let dt = (now_frame - last_frame_time).as_secs_f32();
-        last_frame_time = now_frame;
+        let now = Instant::now();
+        let dt = (now - last_frame_time).as_secs_f32(); // visual: drives FX timing
+        last_frame_time = now;
 
-        // 1) Pull a fresh live frame
-        let mut live = cam.next_frame()?; // mutable: HUD/crosshair and blending will change it
+        /* 1) Grab a fresh live frame (what the camera sees right now).
+           Visual: this is the raw base we’ll start from. */
+        let live = cam.next_frame()?; // immutable here; we copy it into screen below
 
-        // 2) Inputs
-        if drawer.r_pressed_once() && !capturing_bg {
-            capturing_bg = true;
-            captured.clear();
-            bg_image = None;
-            clear_mask(&mut mask); // reset erase when starting a new BG
+        /* 2) Inputs */
+        if drawer.b_pressed_once() { show_blur = !show_blur; } // visual: toggles BLUR preview (debug)
+        if drawer.c_pressed_once() {                           // visual: eraser cleared (blur disappears)
+            for a in &mut mask.alpha { *a = 0.0; }
             mask_has_any = false;
         }
-        if drawer.b_pressed_once() {
-            show_bg = !show_bg;
-        }
-        if drawer.c_pressed_once() {
-            clear_mask(&mut mask);
-            mask_has_any = false;
-        } // clears erase only
 
-        // 3) Capture flow
-        if capturing_bg {
-            captured.push(live.clone());
-            if captured.len() >= BG_CAPTURE_COUNT {
-                let bg = median_background(&captured)?;
-                bg_image = Some(bg);
-                capturing_bg = false;
-            }
-        }
-
-        // 4) Eraser dab + FX spawn when LMB held and BG exists
+        // Paint when holding left mouse: α grows under the cursor (soft edges).
         let mut erasing_now = false;
-        if let (Some(_bg), true) = (bg_image.as_ref(), drawer.left_mouse_down()) {
+        if drawer.left_mouse_down() {
             if let Some((mx, my)) = drawer.mouse_pos() {
-                dab_mask(&mut mask, mx as i32, my as i32, &stamp); // eraser grows here
-                mask_has_any = true;
+                vision::dab_mask(&mut mask, mx as i32, my as i32, &stamp); // visual: mask accumulates
+                mask_has_any = true;                                       // visual: enables blending
                 erasing_now = true;
-
-                // --- FX spawns at the cursor while erasing ---
-                // Visual: sparkles pop around the eraser location
-                fx.spawn_sparkles(mx as f32, my as f32, 28);
-
-                // Visual: occasionally a lightning bolt cracks near the cursor
+                fx.spawn_sparkles(mx as f32, my as f32, 12);               // visual: glows appear
                 fx.maybe_spawn_bolt(mx as f32, my as f32);
             }
         }
 
-        if show_bg {
-            if let Some(bg) = &bg_image {
-                // Visual: you see the static background immediately
-                screen.pixels.copy_from_slice(&bg.pixels);
-            } else {
-                // No BG yet: show the live frame
-                screen.pixels.copy_from_slice(&live.pixels);
-            }
+        /* 3) Build the blurred sink from the live frame (BLUR(LIVE)).
+           Visual: not shown directly unless B is on; used for eraser mixing. */
+        box_blur_rgb(&live, &mut blur_tmp, &mut blur_sink, blur_radius)?;
+
+        /* 4) Choose what to show as the base image this frame. */
+        if show_blur {
+            // Visual: full-screen blurred camera (debug view)
+            screen.pixels.copy_from_slice(&blur_sink.pixels);
         } else {
-            // Normal path: show the live camera
+            // Visual: raw live camera
             screen.pixels.copy_from_slice(&live.pixels);
         }
 
-        // If we have BG and the mask has any painted pixels, blend in place on 'screen'.
-        if !show_bg {
-            if mask_has_any {
-                if let Some(bg) = &bg_image {
-                    // Visual: wherever you erased, BG shows with seamless edges; much less CPU
-                    blend_linear_in_place(&mut screen, bg, &mask, &lut)?;
-                }
-            }
+        /* 5) If we have any painted mask, blend BLUR into LIVE where α>0.
+           Visual: you “paint blur” into the live feed with soft edges. */
+        if !show_blur && mask_has_any {
+            blend_linear_in_place(&mut screen, &blur_sink, &mask, &lut)?; // visual: blur appears under brush
         }
 
-        // 6) Update & render FX on top (additive glow/bolt)
-        fx.update_and_render(&mut screen, dt);
+        /* 6) FX on top (sparkles/bolt), crosshair, HUD text */
+        fx.update_and_render(&mut screen, dt);                             // visual: glows fade & drift
 
-        // 7) Crosshair + HUD
         if let Some((mx, my)) = drawer.mouse_pos() {
-            let yellow = 0x00_FF_CC_33;
-            draw_crosshair(&mut screen, mx as i32, my as i32, 12, yellow);
+            draw_crosshair(&mut screen, mx as i32, my as i32, 12, 0x00_FF_CC_33); // visual: yellow + at cursor
         }
 
-        // HUD status line
-        let status = if capturing_bg {
-            format!("CAPTURING ({}/{})", captured.len(), BG_CAPTURE_COUNT)
-        } else if bg_image.is_some() {
-            if show_bg {
-                "BG READY (Showing)".to_string()
-            } else {
-                "BG READY".to_string()
-            }
-        } else {
-            "IDLE".to_string()
-        };
-        let hint = if bg_image.is_some() {
-            if erasing_now {
-                " | LMB: erasing…  C: clear  FX"
-            } else {
-                " | LMB: erase  C: clear  FX"
-            }
-        } else {
-            " | Press R to capture BG"
-        };
+        let status = if show_blur { "BLUR (Showing)" } else { "LIVE" };    // visual: left HUD tag
+        let hint = if erasing_now { " | LMB: painting blur…  C: clear  B: show BLUR" }
+                   else            { " | LMB: paint blur     C: clear  B: show BLUR" };
         let hud = format!("{}{} | {}", status, hint, hud_fps_text);
-        let white = 0x00_FF_FF_FF;
-        draw_text_5x7(&mut screen, 8, 8, &hud, white);
+        draw_text_5x7(&mut screen, 8, 8, &hud, 0x00_FF_FF_FF);             // visual: small white HUD
 
-        // 8) Present to screen
-        drawer.present( &screen)?;
+        /* 7) Present to the window (this is when the on-screen image updates). */
+        drawer.present(&screen)?;
 
-        // 9) FPS accounting (terminal + HUD)
+        /* 8) FPS counter (prints to terminal + HUD once per second) */
         frames_this_second += 1;
-        let now = Instant::now();
         if now.duration_since(last_fps_time) >= Duration::from_secs(1) {
             let secs = now.duration_since(last_fps_time).as_secs_f32();
             let fps = frames_this_second as f32 / secs;
-            println!("FPS: {:.1}", fps);
-            hud_fps_text = format!("FPS: {:.1}", fps);
+            println!("FPS: {:.1}", fps);                   // terminal
+            hud_fps_text = format!("FPS: {:.1}", fps);     // HUD part
             frames_this_second = 0;
             last_fps_time = now;
         }
